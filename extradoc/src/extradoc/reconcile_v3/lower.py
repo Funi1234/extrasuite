@@ -949,13 +949,15 @@ def _split_on_insert_tables(batch: list[Request]) -> list[list[Request]]:
     if not any(r.insert_table is not None for r in batch):
         return [batch]
 
-    def _req_index(r: Request) -> int | None:
+    def _req_coordinate(r: Request) -> tuple[int, str | None, str | None] | None:
         if r.insert_text is not None and r.insert_text.location is not None:
-            idx = r.insert_text.location.index
-            return idx if isinstance(idx, int) else None
+            location = r.insert_text.location
+            if isinstance(location.index, int):
+                return location.index, location.tab_id, location.segment_id
         if r.insert_table is not None and r.insert_table.location is not None:
-            idx = r.insert_table.location.index
-            return idx if isinstance(idx, int) else None
+            location = r.insert_table.location
+            if isinstance(location.index, int):
+                return location.index, location.tab_id, location.segment_id
         return None
 
     result: list[list[Request]] = []
@@ -965,10 +967,14 @@ def _split_on_insert_tables(batch: list[Request]) -> list[list[Request]]:
         if req.insert_table is not None:
             # Move any trailing same-index requests from current into the new
             # sub-batch so they stay co-located with the insertTable.
-            table_index = _req_index(req)
+            table_coordinate = _req_coordinate(req)
             carry: list[Request] = []
-            if table_index is not None:
-                while current and _req_index(current[-1]) == table_index:
+            if table_coordinate is not None:
+                while (
+                    current
+                    and current[-1].insert_table is None
+                    and _req_coordinate(current[-1]) == table_coordinate
+                ):
                     carry.append(current.pop())
                 carry.reverse()
             if current:
@@ -980,7 +986,226 @@ def _split_on_insert_tables(batch: list[Request]) -> list[list[Request]]:
     if current:
         result.append(current)
 
+    # Splitting protects each table's own cell-fill requests, but it also
+    # creates a new coordinate boundary: requests in a later sub-batch still
+    # carry coordinates from before the table was inserted.  Rebase those
+    # coordinates across the structural inserts that happened in earlier
+    # sub-batches.  Without this, a later paragraph update can target the
+    # middle of an earlier paragraph and produce the garbled text seen in the
+    # RCA template's Action Plan.
+    return _rebase_subbatches_after_table_inserts(result)
+
+
+def _rebase_subbatches_after_table_inserts(
+    batches: list[list[Request]],
+) -> list[list[Request]]:
+    """Rebase body coordinates after table-containing sub-batches.
+
+    ``insertTable`` adds structural characters in addition to any cell text.
+    The lowering pass computes every request against the pre-table document,
+    so later sub-batches need the net insertion delta at each prior insertion
+    position.  Requests at the same position are intentionally left there:
+    inserting at that position in a later batch places content before the
+    already-created table, preserving desired order.
+    """
+    prior_events: list[tuple[int, int, str | None]] = []
+    rebased: list[list[Request]] = []
+
+    for batch in batches:
+        table_events = _body_insert_events_for_table_batch(batch)
+        table_bounds = _table_batch_bounds(batch)
+        if prior_events:
+            batch = [
+                (
+                    req
+                    if table_bounds is not None
+                    and _request_is_inside_table(req, table_bounds)
+                    else _rebase_request_after_events(req, prior_events)
+                )
+                for req in batch
+            ]
+        rebased.append(batch)
+        # Keep event positions in the original lowering frame.  The request
+        # coordinates being rebased were generated in that same frame; using
+        # a table index from an already-rebased batch mixes coordinate spaces.
+        prior_events.extend(table_events)
+
+    return rebased
+
+
+def _body_insert_events_for_table_batch(
+    batch: list[Request],
+) -> list[tuple[int, int, str | None]]:
+    """Return body-coordinate insert deltas introduced by one table batch.
+
+    A table request represents the complete empty-table skeleton.  The
+    following insertText requests that land inside that skeleton populate its
+    cells and are folded into the same event so they are not counted twice.
+    Other insert requests remain independent events (for example paragraphs
+    inserted immediately before a table).
+    """
+    table_group = _table_group_requests(batch)
+    if not table_group:
+        return []
+    table_request = table_group[0]
+    location = table_request.insert_table.location
+    assert location is not None and isinstance(location.index, int)
+    table_index = location.index
+    tab_id = location.tab_id
+    # Normal text insertion deltas are already included in the original
+    # post-insert-shift calculation.  Only the table's extra structural
+    # overhead must cross a newly-created batch boundary.
+    same_batch_credit = _batch_insert_size_from_reqs(table_group) + 1
+    structural_delta = _inserted_element_size(table_group) - same_batch_credit
+    return [(table_index, structural_delta, tab_id)] if structural_delta else []
+
+
+def _table_group_requests(batch: list[Request]) -> list[Request]:
+    """Return one body table request and its contiguous cell-fill requests."""
+    table_positions = [i for i, req in enumerate(batch) if req.insert_table is not None]
+    if len(table_positions) != 1:
+        return []
+    table_pos = table_positions[0]
+    table_request = batch[table_pos]
+    location = table_request.insert_table.location
+    if (
+        location is None
+        or location.segment_id is not None
+        or not isinstance(location.index, int)
+    ):
+        return []
+
+    table_index = location.index
+    tab_id = location.tab_id
+    group = [table_request]
+    for req in batch[table_pos + 1 :]:
+        if req.delete_content_range is not None:
+            break
+        coordinates = _request_coordinates(req)
+        if not coordinates or any(
+            segment_id is not None
+            or req_tab_id != tab_id
+            or index <= table_index
+            for index, req_tab_id, segment_id in coordinates
+        ):
+            break
+        group.append(req)
+    return group
+
+
+def _table_batch_bounds(
+    batch: list[Request],
+) -> tuple[int, int, str | None] | None:
+    """Return the coordinate bounds occupied by the table in ``batch``."""
+    table_group = _table_group_requests(batch)
+    if not table_group:
+        return None
+    table_request = table_group[0]
+    location = table_request.insert_table.location
+    if location is None or not isinstance(location.index, int):
+        return None
+    start = location.index
+    end = start + _inserted_element_size(table_group)
+    return start, end, location.tab_id
+
+
+def _inserted_element_size(reqs: list[Request]) -> int:
+    """Return the live-document delta for an inserted element.
+
+    Cell-fill text is already included in ``reqs``.  Include the carrier
+    position used by the batch coordinate contract when crossing batches.
+    """
+    return _final_doc_size_from_reqs(reqs)
+
+
+def _request_is_inside_table(
+    req: Request,
+    bounds: tuple[int, int, str | None],
+) -> bool:
+    """Whether all body coordinates in ``req`` belong to this table."""
+    start, end, tab_id = bounds
+    coordinates = _request_coordinates(req)
+    return bool(coordinates) and all(
+        req_tab_id == tab_id
+        and segment_id is None
+        and start < index <= end
+        for index, req_tab_id, segment_id in coordinates
+    )
+
+
+def _request_coordinates(
+    req: Request,
+) -> list[tuple[int, str | None, str | None]]:
+    """Collect body coordinate values from a request."""
+    data = req.model_dump(by_alias=True, exclude_none=True)
+    result: list[tuple[int, str | None, str | None]] = []
+
+    def walk(value: object) -> None:
+        if isinstance(value, dict):
+            if _is_body_coordinate(value):
+                tab_id = value.get("tabId")
+                for index_key in ("index", "startIndex", "endIndex"):
+                    index = value.get(index_key)
+                    if isinstance(index, int):
+                        segment_id = value.get("segmentId")
+                        result.append(
+                            (
+                                index,
+                                tab_id if isinstance(tab_id, str) else None,
+                                segment_id if isinstance(segment_id, str) else None,
+                            )
+                        )
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(data)
     return result
+
+
+def _rebase_request_after_events(
+    req: Request,
+    events: list[tuple[int, int, str | None]],
+) -> Request:
+    """Shift body coordinates in ``req`` across prior insertion events."""
+    data = req.model_dump(by_alias=True, exclude_none=True)
+
+    def walk(value: object) -> None:
+        if isinstance(value, dict):
+            if _is_body_coordinate(value):
+                tab_id = value.get("tabId")
+                segment_id = value.get("segmentId")
+                if segment_id is None:
+                    for index_key in ("index", "startIndex", "endIndex"):
+                        index = value.get(index_key)
+                        if not isinstance(index, int):
+                            continue
+                        shift = sum(
+                            delta
+                            for event_index, delta, event_tab_id in events
+                            if event_tab_id == tab_id
+                            and index > event_index
+                        )
+                        if shift:
+                            value[index_key] = index + shift
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(data)
+    return Request.model_validate(data)
+
+
+def _is_body_coordinate(value: dict[str, object]) -> bool:
+    """Identify a Docs Location, Range, or table-start coordinate dict."""
+    return (
+        ("index" in value and ("tabId" in value or "segmentId" in value))
+        or ("startIndex" in value and "endIndex" in value)
+    )
 
 
 def _fix_deferred_batch_index(req: Request, target_batch_index: int) -> None:
@@ -1546,7 +1771,12 @@ def _plan_insertions(
             in_unsupported_region=in_unsupported_region,
         )
         planned.append((insert_pos, desired_idx, reqs))
-        insert_metadata.append((raw_insert_pos, _batch_insert_size_from_reqs(reqs)))
+        insert_size = _batch_insert_size_from_reqs(reqs)
+        if any(req.insert_table is not None for req in reqs):
+            # Preserve the existing same-batch structural credit; the table
+            # end-marker correction is handled across batch boundaries.
+            insert_size += 1
+        insert_metadata.append((raw_insert_pos, insert_size))
 
     # Phase 2: Emit requests in the correct order.
     #
@@ -1675,7 +1905,7 @@ def _final_doc_size_from_reqs(reqs: list[Request]) -> int:
             cols = it.columns or 0
             # Empty table as emitted by insertTable: pre-\n (1) + table opener
             # (1) + rows * (row opener (1) + cols * (cell opener (1) +
-            # terminal \n (1))) + trailing \n (1).
+            # terminal \n (1))) + table end marker (1).
             total += 2 + rows * (1 + cols * 2) + 1
         elif req.insert_page_break is not None:
             total += 2
@@ -1692,9 +1922,8 @@ def _batch_insert_size_from_reqs(reqs: list[Request]) -> int:
     counted: here we count only the table skeleton as the API delta
     (``1 + rows * (1 + cols * 2)``), matching the request-level accounting
     used by the matched-element post_insert_shift.  We do NOT add the
-    pre-paragraph \\n or trailing carrier paragraph here — those are either
-    absorbed into the existing paragraph structure or emitted as separate
-    ``insertText`` requests already counted above.
+    pre-paragraph \\n here — that is absorbed into the existing paragraph structure
+    or emitted as a separate ``insertText`` request already counted above.
     """
     total = 0
     for req in reqs:
@@ -3305,10 +3534,6 @@ def _lower_table_insert(
             # must work correctly.
             insertable = [e for e in cell_content if not _is_cell_terminal(e)]
 
-            # Compute estimated char count using element sizes to decide
-            # whether there is anything to insert (same guard as before).
-            estimated_inserted_chars = sum(_element_size(e) for e in insertable)
-
             # Emit insert requests for this cell and track the ACTUAL number
             # of characters inserted.  We cannot use _element_size() alone
             # here because it counts all paragraph elements including
@@ -3319,6 +3544,7 @@ def _lower_table_insert(
             # _element_size() to advance ``running`` would over-count and
             # shift all subsequent cell positions by the number of such
             # opaque elements in the cell.
+            estimated_inserted_chars = sum(_element_size(e) for e in insertable)
             actual_inserted_chars = 0
             if estimated_inserted_chars > 0:
                 running = content_start
@@ -4215,7 +4441,7 @@ def _compute_index_shift_for_body_ref(
                 continue
             text = it.text or ""
             if loc.index <= current:
-                current += len(text)
+                current += utf16_len(text)
             continue
         if dcr is not None:
             rng = dcr.range
